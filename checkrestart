@@ -1,0 +1,304 @@
+#!/bin/bash
+# Copyright 2016 Stuart Shelton
+# Distributed under the terms of the GNU General Public License v2
+
+#
+# checkrestart
+#
+# A shell-based tool to identify running processes whose binaries have been
+# replaced or which are linked against old libraries; named for Debian's
+# similar utility.
+#
+
+set -u
+
+declare -i debug="${DEBUG:-0}"
+declare -i trace="${TRACE:-0}"
+
+declare -i restart=0
+declare -i quiet=0
+declare -i silent=0
+
+declare -a seen=()
+declare -i columns=${COLUMNS:-$( tput cols 2>/dev/null )}
+(( columns )) || columns=79
+
+function die() {
+	echo >&2 "FATAL: ${*:-Unknown error}"
+	exit 1
+} # die
+
+function findpid() {
+	local -i pid="${1:-0}" rc=0 ; shift
+	local pattern="${*:-}"
+	local -a pidfiles
+
+	(( pid )) || return 1
+	[[ -n "${pattern:-}" ]] || return 1
+
+	pidfiles=( $( find /var/run/ -type f -exec grep -H "^${pattern}$" {} + | cut -d':' -f 1 ) )
+	if (( 1 < ${#pidfiles[@]} )) && ! (( silent )); then
+		if type -pf fold >/dev/null 2>&1; then
+			echo >&2 "   WARN: Found multiple PID-files for process ${pid} ($( ps -q ${pid} -o comm= )): $( sed 's/ /, /g' <<<"${pidfiles[*]}" )" | fold -sw ${columns} | sed -r 's/^([0-9])/         \1/'
+		else
+			echo >&2 "   WARN: Found multiple PID-files for process ${pid} ($( ps -q ${pid} -o comm= )):"
+			echo >&2 "${pidfiles[@]}" | xargs -n 1 echo $'\t'
+		fi
+	fi
+
+	echo "${pidfiles[*]:-}"
+
+	return 0
+} # findpid
+
+function restartsvc() {
+	local svc="${1:-}"
+
+	[[ -n "${svc:-}" ]] || return 128 # Invalid argument (to exit)
+
+	if [[ "${name}" =~ ^net\. ]] || [[ "${name}" =~ ^rpc[.b] ]]; then
+		if (( restart )); then
+			echo >&2 "   WARN: Not restarting network-essential service '${name}' which requires a restart"
+			return 126 # Command invoked cannot execute
+		else
+			echo >&2 "   WARN: Would not restart network-essential service '${name}' which requires a restart"
+			return 1
+		fi
+	fi
+
+	if type -pf rc-config >/dev/null 2>&1; then
+		if ! rc-config show --all 2>/dev/null | grep -q "^\s*${name}\s+\[(started|crashed)\]$"; then
+			if (( restart )); then
+				echo >&2 "   WARN: Not restarting non-running service '${name}'"
+				return 126 # Command invoked cannot execute
+			else
+				echo >&2 "   WARN: Would not restart non-running service '${name}'"
+				return 1
+			fi
+		fi
+	fi
+
+	if (( silent )); then
+		if (( restart )); then
+			/etc/init.d/"${name}" --quiet --nodeps restart
+			return ${?}
+		fi
+	elif (( quiet )); then
+		echo " * Service '${name}' has been upgraded and requires a restart ..."
+		if (( restart )); then
+			/etc/init.d/"${name}" --quiet --nodeps restart
+			return ${?}
+		fi
+	else
+		echo " * Service '${name}' has been upgraded and requires a restart ..."
+		if (( restart )); then
+			/etc/init.d/"${name}" --nodeps restart
+			return ${?}
+		fi
+	fi
+
+	(( restart )) || return 0
+
+	return 127 # Command not found
+} # restartsvc
+
+function findsvc() {
+	local -i pid="${1:-0}" rc=0 src=0 ; shift
+	local pidfile name
+	local -a pidfiles svcs
+
+	(( pid )) || return 1
+
+	pidfiles=( $( findpid ${pid} "${pid}" ) )
+	if (( 0 == ${#pidfiles[@]} )); then
+		#pidfiles=( $( findpid ${pid} "${pid}\..*" ) )
+		#if (( 0 == ${#pidfiles[@]} )); then
+			(( quiet || silent || ! debug )) || echo >&2 "   INFO: No PID-file found matching process ${pid} ($( ps -q ${pid} -o comm= || echo "unknown" ))"
+
+			name="$( ps -q ${pid} -o comm= )"
+			[[ -n "${name:-}" ]] || return 0 # Child of restarted parent?
+
+			if [[ -x /etc/init.d/"${name}" || -x /etc/init.d/"${name}"d ]]; then
+				if [[ -x /etc/init.d/"${name}"d ]]; then
+					name="${name}d"
+				fi
+				if ! grep -q " ${name} " <<<" ${seen[*]:-} "; then
+					restartsvc "${name}"
+					src=${?}
+					(( restart && src )) || seen+=( "${name}" )
+				fi
+				return 0
+			else
+				return 1
+			fi
+		#else
+		#	(( quiet || silent )) || echo >&2 "   WARN: Fuzzy match on process ${pid} ($( ps -q ${pid} -o comm= )): found $( sed 's/ /, /g' <<<"${pidfiles[*]}" )" | fold -sw ${columns} | sed -r 's/^([0-9])/         \1/'
+		#fi
+
+		die "Unreachable"
+	fi
+	for pidfile in "${pidfiles[@]}"; do
+		name="$( basename "${pidfile%.pid}" )"
+		name="${name%d}"
+
+		if ! [[ -x /etc/init.d/"${name}" || -x /etc/init.d/"${name}"d ]]; then
+			if [[ "$( basename "$( dirname "${pidfile}" )" )" != "run" ]]; then
+				name="$( basename "$( dirname "${pidfile}" )" )"
+			fi
+			if [[ "$( basename "${pidfile}" )" =~ ^(ppp-)?ppp[0-9]+\.pid ]]; then
+				name="net.$( grep -o 'ppp[0-9]\+' <<<"$( basename "${pidfile}" )" )"
+			fi
+			if [[ "$( basename "${pidfile}" )" =~ ^netplugd-.*\.pid ]]; then
+				name="net.$( cut -d'-' -f 2 <<<"${pidfile}" | sed 's/\.pid$//' )"
+			fi
+		fi
+
+		if ! [[ -x /etc/init.d/"${name}" || -x /etc/init.d/"${name}"d ]]; then
+			svcs=( $( grep -H "${pidfile}" /etc/init.d/* | cut -d':' -f 1 | sort | uniq ) )
+			if (( 0 == ${#svcs[@]} )); then
+				name="$( ps -q ${pid} -o comm= )"
+				if [[ -x /etc/init.d/"${name}" || -x /etc/init.d/"${name}"d ]]; then
+					local oldname="${name}"
+					[[ -x /etc/init.d/"${name}"d ]] && name="${name}d"
+					(( quiet || silent || ! debug )) || echo >&2 "   INFO: Found service '${name}' for PID ${pid} (${oldname})"
+					unset oldname
+				else
+					(( silent )) || echo >&2 " - Cannot find service for PID file '${pidfile}', PID ${pid} (${name})"
+					rc=1
+					continue
+				fi
+			elif (( 1 < ${#svcs[@]} )); then
+				#if ! (( silent )); then
+					if type -pf fold >/dev/null 2>&1; then
+						echo >&2 " - Cannot find unique service for PID file '${pidfile}', PID ${pid} ($( ps -q ${pid} -o comm= )): candidates are $( sed 's/ /, /g' <<<"${svcs[*]}" )" | fold -sw ${columns} | sed -r 's/^([0-9])/   \1/'
+					else
+						echo >&2 " - Cannot find unique service for PID file '${pidfile}', PID ${pid} ($( ps -q ${pid} -o comm= )): candidates are:"
+						echo >&2 "${svcs[@]}" | xargs -n 1 echo $'\t'
+					fi
+				#fi
+				rc=1
+				continue
+			else
+				name="$( basename "${svcs[0]}" )"
+			fi
+		fi
+
+		if [[ -n "${name:-}" ]] && [[ -x /etc/init.d/"${name}" || -x /etc/init.d/"${name}"d ]]; then
+			if [[ -x /etc/init.d/"${name}"d ]]; then
+				name="${name}d"
+			fi
+			if ! grep -q " ${name} " <<<" ${seen[*]:-} "; then
+				restartsvc "${name}"
+				src=${?}
+				(( restart && src )) || seen+=( "${name}" )
+			fi
+		else
+			rc=1
+			continue
+		fi
+	done
+
+	return ${rc}
+} # findsvc
+
+function checkexe() {
+	local -ai pids
+	local -i pid rc=0
+
+	pids=( $(
+		find /proc/ -mindepth 2 -maxdepth 2 -type l -name exe -exec ls -l {} + 2>/dev/null |
+			grep ' -> .* (deleted)$' |
+			grep -o '/proc/[0-9]\+/exe' |
+			cut -d'/' -f 3 |
+			sort -n |
+			uniq
+	) )
+
+	if (( 0 == ${#pids[@]} )); then
+		(( quiet || silent )) || echo "* No obsolete processes found"
+		return 0
+	fi
+
+	if ! (( silent )); then
+		if type -pf fold >/dev/null 2>&1; then
+			echo "* Found obsolete processes: $( sed 's/ /, /g' <<<"${pids[*]}" )" | fold -sw ${columns} | sed -r 's/^([0-9])/   \1/'
+		else
+			echo "* Found obsolete processes:"
+			echo "${pids[@]}" | xargs -n 1 echo $'\t'
+		fi
+	fi
+	for pid in "${pids[@]}"; do
+		findsvc ${pid} || rc+=${?}
+	done
+
+	return $(( 0 != rc ))
+} # checkexe
+
+function checklib() {
+	local -ai pids
+	local -i pid rc=0
+
+	pids=( $(
+		find /proc/ -mindepth 2 -maxdepth 2 -type f -name maps -exec grep -HF '(deleted)' {} + 2>/dev/null |
+			grep -Ev '\s+/(anon_hugepage|dev/zero|var/run/.*|tmp/.*|SYSV[0-9]+|\[[^]]+\]) \(deleted\)$' |
+			cut -d'/' -f 3 |
+			sort -n |
+			uniq
+	) )
+
+	if (( 0 == ${#pids[@]} )); then
+		(( quiet || silent )) || echo "* No obsolete library images found"
+		return 0
+	fi
+
+	if ! (( silent )); then
+		if type -pf fold >/dev/null 2>&1; then
+			echo "* Found processes using obsolete libraries: $( sed 's/ /, /g' <<<"${pids[*]}" )" | fold -sw ${columns} | sed -r 's/^([0-9])/   \1/'
+		else
+			echo "* Found processes using obsolete libraries:"
+			echo "${pids[@]}" | xargs -n 1 echo $'\t'
+		fi
+	fi
+	for pid in "${pids[@]}"; do
+		findsvc ${pid} || rc+=${?}
+	done
+
+	return $(( 0 != rc ))
+} # checklib
+
+function main() {
+	local -i rc=0
+
+	(( EUID )) && die "Please re-run '$( basename "${0}" )' as UID 0"
+
+	if grep -Eq ' -(h|-help) ' <<<" ${*} "; then
+		echo "Usage: $( basename "${0}" ) [--quiet | --silent] [--restart]"
+		exit 0
+	fi
+	if grep -Eq ' -(r|-restart) ' <<<" ${*} "; then
+		restart=1
+	fi
+	if grep -Eq ' -(q|-quiet) ' <<<" ${*} "; then
+		quiet=1
+	fi
+	if grep -Eq ' -(s|-silent) ' <<<" ${*} "; then
+		silent=1
+	fi
+
+	(( trace )) && set -o xtrace
+
+	(( quiet || silent )) || echo "Searching for obsolete processes and library images ..."
+
+	checkexe || rc=1
+	checklib || rc=1
+
+	(( trace )) && set +o xtrace
+
+	return ${rc}
+} # main
+
+main "${@:-}"
+
+exit ${?}
+
+# vi: set syntax=sh nowrap:
