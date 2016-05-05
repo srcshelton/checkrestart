@@ -67,7 +67,7 @@ function restartsvc() {
 	fi
 
 	if type -pf rc-config >/dev/null 2>&1; then
-		if ! rc-config show --all 2>/dev/null | grep -q "^\s*${name}\s+\[(started|crashed)\]$"; then
+		if ! rc-config show --all 2>/dev/null | grep -Eq "^\s*${name}\s+\[(started|crashed)\]$"; then
 			if (( restart )); then
 				echo >&2 "   WARN: Not restarting non-running service '${name}'"
 				return 126 # Command invoked cannot execute
