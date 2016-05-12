@@ -23,28 +23,64 @@ declare -a seen=()
 declare -i columns=${COLUMNS:-$( tput cols 2>/dev/null )}
 (( columns )) || columns=79
 
+einfo='echo'
+ewarn='echo'
+eerror='echo'
+ebegin='echo'
+eend=':'
+
+if [[ -s /lib/rc/sh/functions.sh ]]; then
+	if ! grep -Eq ' -(C|-n(c|o-?colou?r)) ' <<<" ${*:-} "; then
+		# Sets "RC_GOT_FUNCTIONS='yes'"
+		source /lib/rc/sh/functions.sh
+		einfo='einfo'
+		ewarn='ewarn'
+		eerror='eerror'
+		ebegin='ebegin'
+		eend='eend'
+	fi
+fi
+
+# We don't warn on unbound variables before now as stock OpenRC functions.sh
+# has two such cases in it, as of sys-apps/openrc-0.19.1 :(
+#
+set -u
+
 function die() {
-	echo >&2 "FATAL: ${*:-Unknown error}"
+	local prefix=''
+
+	[[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]] || prefix='FATAL: '
+
+	${eerror} >&2 "${prefix}${*:-Unknown error}"
+
 	exit 1
 } # die
 
 function findpid() {
 	local -i pid="${1:-0}" rc=0 ; shift
-	local pattern="${*:-}"
+	local pattern="${*:-}" prefix=''
 	local -a pidfiles
 
 	(( pid )) || return 1
 	[[ -n "${pattern:-}" ]] || return 1
 
+	if [[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]]; then
+		eindent
+	else
+		prefix='   WARN: '
+	fi
+
 	pidfiles=( $( find /var/run/ -type f -exec grep -H "^${pattern}$" {} + | cut -d':' -f 1 ) )
 	if (( 1 < ${#pidfiles[@]} )) && ! (( silent )); then
+		${ewarn} >&2 "${spaces}Found multiple PID-files for process ${pid} ($( ps -q ${pid} -o comm= )):"
 		if type -pf fold >/dev/null 2>&1; then
-			echo >&2 "   WARN: Found multiple PID-files for process ${pid} ($( ps -q ${pid} -o comm= )): $( sed 's/ /, /g' <<<"${pidfiles[*]}" )" | fold -sw ${columns} | sed -r 's/^([0-9])/         \1/'
+			sed 's/ /, /g' <<<"${pidfiles[*]}" | fold -sw ${columns} | sed -r 's/^([0-9])/   \1/'
 		else
-			echo >&2 "   WARN: Found multiple PID-files for process ${pid} ($( ps -q ${pid} -o comm= )):"
-			echo >&2 "${pidfiles[@]}" | xargs -n 1 echo $'\t'
+			sed 's/ /, /g' <<<"${pidfiles[*]}"
 		fi
 	fi
+
+	[[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]] && eoutdent
 
 	echo "${pidfiles[*]:-}"
 
@@ -52,16 +88,23 @@ function findpid() {
 } # findpid
 
 function restartsvc() {
-	local svc="${1:-}"
+	local svc="${1:-}" prefix=''
+	local -i rc=0
 
 	[[ -n "${svc:-}" ]] || return 128 # Invalid argument (to exit)
 
+	[[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]] || prefix='   WARN: '
+
 	if [[ "${name}" =~ ^net\. ]] || [[ "${name}" =~ ^rpc[.b] ]]; then
 		if (( restart )); then
-			echo >&2 "   WARN: Not restarting network-essential service '${name}' which requires a restart"
+			[[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]] && eindent
+			${ewarn} >&2 "${prefix}Not restarting network-essential service '${name}' which requires a restart"
+			[[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]] && eoutdent
 			return 126 # Command invoked cannot execute
 		else
-			echo >&2 "   WARN: Would not restart network-essential service '${name}' which requires a restart"
+			[[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]] && eindent
+			${ewarn} >&2 "${prefix}Would not restart network-essential service '${name}' which requires a restart"
+			[[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]] && eoutdent
 			return 1
 		fi
 	fi
@@ -69,31 +112,44 @@ function restartsvc() {
 	if type -pf rc-config >/dev/null 2>&1; then
 		if ! rc-config show --all 2>/dev/null | grep -Eq "^\s*${name}\s+\[(started|crashed)\]$"; then
 			if (( restart )); then
-				echo >&2 "   WARN: Not restarting non-running service '${name}'"
+				[[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]] && eindent
+				${ewarn} >&2 "${prefix}Not restarting non-running service '${name}'"
+				[[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]] && eoutdent
 				return 126 # Command invoked cannot execute
 			else
-				echo >&2 "   WARN: Would not restart non-running service '${name}'"
+				[[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]] && eindent
+				${ewarn} >&2 "${prefix}Would not restart non-running service '${name}'"
+				[[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]] && eoutdent
 				return 1
 			fi
 		fi
 	fi
 
+	[[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]] || prefix=' * '
+
 	if (( silent )); then
 		if (( restart )); then
 			/etc/init.d/"${name}" --quiet --nodeps restart
-			return ${?}
+			rc=${?}
+			return ${rc}
 		fi
 	elif (( quiet )); then
-		echo " * Service '${name}' has been upgraded and requires a restart ..."
+		[[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]] && eindent
+		${einfo} "${prefix}Service '${name}' has been upgraded and requires a restart ..."
+		[[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]] && eoutdent
 		if (( restart )); then
 			/etc/init.d/"${name}" --quiet --nodeps restart
-			return ${?}
+			rc=${?}
+			return ${rc}
 		fi
 	else
-		echo " * Service '${name}' has been upgraded and requires a restart ..."
+		[[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]] && eindent
+		${einfo} "${prefix}Service '${name}' has been upgraded and requires a restart ..."
+		[[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]] && eoutdent
 		if (( restart )); then
 			/etc/init.d/"${name}" --nodeps restart
-			return ${?}
+			rc=${?}
+			return ${rc}
 		fi
 	fi
 
@@ -104,16 +160,20 @@ function restartsvc() {
 
 function findsvc() {
 	local -i pid="${1:-0}" rc=0 src=0 ; shift
-	local pidfile name
+	local pidfile name prefix=''
 	local -a pidfiles svcs
 
 	(( pid )) || return 1
+
+	[[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]] || prefix='   INFO: '
 
 	pidfiles=( $( findpid ${pid} "${pid}" ) )
 	if (( 0 == ${#pidfiles[@]} )); then
 		#pidfiles=( $( findpid ${pid} "${pid}\..*" ) )
 		#if (( 0 == ${#pidfiles[@]} )); then
-			(( quiet || silent || ! debug )) || echo >&2 "   INFO: No PID-file found matching process ${pid} ($( ps -q ${pid} -o comm= || echo "unknown" ))"
+			[[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]] && eindent
+			(( quiet || silent || ! debug )) || ${einfo} >&2 "${prefix}No PID-file found matching process ${pid} ($( ps -q ${pid} -o comm= || echo "unknown" ))"
+			[[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]] && eoutdent
 
 			name="$( ps -q ${pid} -o comm= )"
 			[[ -n "${name:-}" ]] || return 0 # Child of restarted parent?
@@ -132,17 +192,30 @@ function findsvc() {
 				return 1
 			fi
 		#else
-		#	(( quiet || silent )) || echo >&2 "   WARN: Fuzzy match on process ${pid} ($( ps -q ${pid} -o comm= )): found $( sed 's/ /, /g' <<<"${pidfiles[*]}" )" | fold -sw ${columns} | sed -r 's/^([0-9])/         \1/'
+		#	if [[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]]; then
+		#		eindent
+		#	else
+		#		prefix='   WARN: '
+		#	fi
+		#	if ! (( quiet || silent )); then
+		#		${ewarn} >&2 "${prefix}Fuzzy match on process ${pid} ($( ps -q ${pid} -o comm= )): found $( sed 's/ /, /g' <<<"${pidfiles[*]}" )" # | fold -sw ${columns} | sed -r 's/^([0-9])/         \1/'
+		#	fi
+		#	if [[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]]; then
+		#		eoutdent
+		#	else
+		#		prefix='   INFO: '
+		#	fi
 		#fi
 
-		die "Unreachable"
+		die 'Unreachable'
 	fi
+
 	for pidfile in "${pidfiles[@]}"; do
 		name="$( basename "${pidfile%.pid}" )"
 		name="${name%d}"
 
 		if ! [[ -x /etc/init.d/"${name}" || -x /etc/init.d/"${name}"d ]]; then
-			if [[ "$( basename "$( dirname "${pidfile}" )" )" != "run" ]]; then
+			if [[ "$( basename "$( dirname "${pidfile}" )" )" != 'run' ]]; then
 				name="$( basename "$( dirname "${pidfile}" )" )"
 			fi
 			if [[ "$( basename "${pidfile}" )" =~ ^(ppp-)?ppp[0-9]+\.pid ]]; then
@@ -160,22 +233,36 @@ function findsvc() {
 				if [[ -x /etc/init.d/"${name}" || -x /etc/init.d/"${name}"d ]]; then
 					local oldname="${name}"
 					[[ -x /etc/init.d/"${name}"d ]] && name="${name}d"
-					(( quiet || silent || ! debug )) || echo >&2 "   INFO: Found service '${name}' for PID ${pid} (${oldname})"
+					[[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]] && eindent
+					(( quiet || silent || ! debug )) || ${einfo} >&2 "${prefix}Found service '${name}' for PID ${pid} (${oldname})"
+					[[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]] && eoutdent
 					unset oldname
 				else
-					(( silent )) || echo >&2 " - Cannot find service for PID file '${pidfile}', PID ${pid} (${name})"
+					if [[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]]; then
+						eindent
+					else
+						prefix=' - '
+					fi
+					(( silent )) || ${ewarn} >&2 "${prefix}Cannot find service for PID file '${pidfile}', PID ${pid} (${name})"
+					[[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]] && eoutdent
 					rc=1
 					continue
 				fi
 			elif (( 1 < ${#svcs[@]} )); then
+				if [[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]]; then
+					eindent
+				else
+					prefix=' - '
+				fi
 				#if ! (( silent )); then
 					if type -pf fold >/dev/null 2>&1; then
-						echo >&2 " - Cannot find unique service for PID file '${pidfile}', PID ${pid} ($( ps -q ${pid} -o comm= )): candidates are $( sed 's/ /, /g' <<<"${svcs[*]}" )" | fold -sw ${columns} | sed -r 's/^([0-9])/   \1/'
+						${ewarn} >&2 "${prefix}Cannot find unique service for PID file '${pidfile}', PID ${pid} ($( ps -q ${pid} -o comm= )): candidates are $( sed 's/ /, /g' <<<"${svcs[*]}" )" # | fold -sw ${columns} | sed -r 's/^([0-9])/   \1/'
 					else
-						echo >&2 " - Cannot find unique service for PID file '${pidfile}', PID ${pid} ($( ps -q ${pid} -o comm= )): candidates are:"
-						echo >&2 "${svcs[@]}" | xargs -n 1 echo $'\t'
+						${ewarn} >&2 "${prefix}Cannot find unique service for PID file '${pidfile}', PID ${pid} ($( ps -q ${pid} -o comm= )): candidates are:"
+						${ewarn} "${svcs[@]}" | xargs -n 1 -- echo $'\t' >&2
 					fi
 				#fi
+				[[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]] && eoutdent
 				rc=1
 				continue
 			else
@@ -204,6 +291,11 @@ function findsvc() {
 function checkexe() {
 	local -ai pids
 	local -i pid rc=0
+	local prefix=''
+
+	if ! [[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]]; then
+		prefix='* '
+	fi
 
 	pids=( $(
 		find /proc/ -mindepth 2 -maxdepth 2 -type l -name exe -exec ls -l {} + 2>/dev/null |
@@ -215,16 +307,16 @@ function checkexe() {
 	) )
 
 	if (( 0 == ${#pids[@]} )); then
-		(( quiet || silent )) || echo "* No obsolete processes found"
+		(( quiet || silent )) || ${einfo} "${prefix}No obsolete processes found"
 		return 0
 	fi
 
 	if ! (( silent )); then
+		${einfo} "${prefix}Found obsolete processes:"
 		if type -pf fold >/dev/null 2>&1; then
-			echo "* Found obsolete processes: $( sed 's/ /, /g' <<<"${pids[*]}" )" | fold -sw ${columns} | sed -r 's/^([0-9])/   \1/'
+			sed 's/ /, /g' <<<"${pids[*]}" | fold -sw ${columns} | sed -r 's/^([0-9])/   \1/'
 		else
-			echo "* Found obsolete processes:"
-			echo "${pids[@]}" | xargs -n 1 echo $'\t'
+			${einfo} "${pids[@]}" | xargs -n 1 -- echo $'\t'
 		fi
 	fi
 	for pid in "${pids[@]}"; do
@@ -237,26 +329,31 @@ function checkexe() {
 function checklib() {
 	local -ai pids
 	local -i pid rc=0
+	local prefix=''
+
+	if ! [[ "${RC_GOT_FUNCTIONS:-}" == 'yes' ]]; then
+		prefix='* '
+	fi
 
 	pids=( $(
 		find /proc/ -mindepth 2 -maxdepth 2 -type f -name maps -exec grep -HF '(deleted)' {} + 2>/dev/null |
-			grep -Ev '\s+/(anon_hugepage|dev/zero|var/run/.*|tmp/.*|SYSV[0-9]+|\[[^]]+\]) \(deleted\)$' |
+			grep -Ev '\s+/(anon_hugepage|dev/zero|var/run/.*|tmp/.*|SYSV[[:xdigit:]]+|\[[^]]+\]) \(deleted\)$' |
 			cut -d'/' -f 3 |
 			sort -n |
 			uniq
 	) )
 
 	if (( 0 == ${#pids[@]} )); then
-		(( quiet || silent )) || echo "* No obsolete library images found"
+		(( quiet || silent )) || ${einfo} "${prefix}No obsolete library images found"
 		return 0
 	fi
 
 	if ! (( silent )); then
+		${einfo} "${prefix}Found processes using obsolete libraries:"
 		if type -pf fold >/dev/null 2>&1; then
-			echo "* Found processes using obsolete libraries: $( sed 's/ /, /g' <<<"${pids[*]}" )" | fold -sw ${columns} | sed -r 's/^([0-9])/   \1/'
+			sed 's/ /, /g' <<<"${pids[*]}" | fold -sw ${columns} | sed -r 's/^([0-9])/   \1/'
 		else
-			echo "* Found processes using obsolete libraries:"
-			echo "${pids[@]}" | xargs -n 1 echo $'\t'
+			echo "${pids[@]}" | xargs -n 1 -- echo $'\t'
 		fi
 	fi
 	for pid in "${pids[@]}"; do
@@ -287,7 +384,8 @@ function main() {
 
 	(( trace )) && set -o xtrace
 
-	(( quiet || silent )) || echo "Searching for obsolete processes and library images ..."
+	(( quiet || silent )) || ${einfo} "Searching for obsolete processes and library images ..."
+	#(( quiet || silent )) || echo "Searching for obsolete processes and library images ..."
 
 	checkexe || rc=1
 	checklib || rc=1
